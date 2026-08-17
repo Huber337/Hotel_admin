@@ -157,7 +157,7 @@ user_chats = {}
 def get_user_chat(chat_id: int):
     if chat_id not in user_chats:
         user_chats[chat_id] = client.chats.create(
-            model="gemini-3.5-flash-lite",  # Указана стабильная поддерживаемая модель
+            model="gemini-3.5-flash",  # Указана стабильная поддерживаемая модель
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0.7,
