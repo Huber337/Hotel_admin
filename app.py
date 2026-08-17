@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
@@ -8,6 +10,17 @@ from google.genai import types
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Flask-сервер для проходимости Health Check на Render
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def health_check():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
 
 # Инициализация Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -144,7 +157,7 @@ user_chats = {}
 def get_user_chat(chat_id: int):
     if chat_id not in user_chats:
         user_chats[chat_id] = client.chats.create(
-            model="gemini-3.5-flash",
+            model="gemini-2.5-flash-lite",  # Указана стабильная поддерживаемая модель
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0.7,
@@ -184,7 +197,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(bot_reply)
 
-if __name__ == '__main__':
+def main():
+    # Запускаем Flask в фоновом потоке для Render
+    threading.Thread(target=run_flask, daemon=True).start()
+
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -194,3 +210,6 @@ if __name__ == '__main__':
     
     logger.info("Бот запущен...")
     app.run_polling()
+
+if __name__ == '__main__':
+    main()
