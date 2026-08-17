@@ -3,6 +3,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
+from google.genai import types
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -135,31 +136,57 @@ SYSTEM_INSTRUCTION = """
 Тип: <Отель или Гостиница, категория номера>
 Гостей: <Количество гостей>
 [/BOOKING_READY]
+"""
+
+# Хранение чат-сессий пользователей
+user_chats = {}
+
+def get_user_chat(chat_id: int):
+    if chat_id not in user_chats:
+        user_chats[chat_id] = client.chats.create(
+            model="gemini-3.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                temperature=0.7,
+            )
+        )
+    return user_chats[chat_id]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Здравствуйте! Я ИИ-администратор отеля. Чем могу вам помочь?")
+    user_id = update.effective_chat.id
+    user_chats.pop(user_id, None)  # Сброс контекста при /start
+    
+    welcome_text = (
+        "Здравствуйте! 👋 Добро пожаловать в зону отдыха **«Эдем»**!\n\n"
+        "Я ваш виртуальный администратор. Могу подсказать по ценам на бассейн, "
+        "номерам в отеле, тапчанам и помочь забронировать отдых.\n\n"
+        "Чем могу вам помочь?"
+    )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = update.message.text.strip()
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
     try:
-        # Запрос к Gemini 2.5 Flash
-        response = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=user_text,
-            config={'system_instruction': SYSTEM_INSTRUCTION}
-        )
-        bot_reply = response.text
+        chat = get_user_chat(chat_id)
+        response = chat.send_message(user_text)
+        bot_reply = response.text if response.text else "Извините, не удалось сформировать ответ."
     except Exception as e:
         logger.error(f"Ошибка Gemini: {e}")
-        bot_reply = "Извините, возникла временная ошибка при обработке запроса."
+        user_chats.pop(chat_id, None)
+        bot_reply = "Извините, возникла временная ошибка при обработке запроса. Попробуйте написать ещё раз."
 
     await update.message.reply_text(bot_reply)
 
 if __name__ == '__main__':
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
     
-    # Запуск бота в режиме Polling (не нужны никакие Webhook и публичные URL!)
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
