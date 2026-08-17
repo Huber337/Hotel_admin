@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+from datetime import datetime
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -157,7 +158,7 @@ user_chats = {}
 def get_user_chat(chat_id: int):
     if chat_id not in user_chats:
         user_chats[chat_id] = client.chats.create(
-            model="gemini-3.6-flash",  # Указана стабильная поддерживаемая модель
+            model="gemini-3.6-flash",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0.7,
@@ -167,7 +168,7 @@ def get_user_chat(chat_id: int):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
-    user_chats.pop(user_id, None)  # Сброс контекста при /start
+    user_chats.pop(user_id, None)  # Ручной сброс контекста только при команде /start
     
     welcome_text = (
         "Здравствуйте! 👋 Добро пожаловать в зону отдыха **«Эдем»**!\n\n"
@@ -188,14 +189,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         chat = get_user_chat(chat_id)
-        response = chat.send_message(user_text)
+        
+        # Передаем контекст текущей даты при каждом запросе
+        today_str = datetime.now().strftime("%d.%m.%Y")
+        prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
+        
+        response = chat.send_message(prompt_with_context)
         bot_reply = response.text if response.text else "Извините, не удалось сформировать ответ."
     except Exception as e:
         logger.error(f"Ошибка Gemini: {e}")
-        user_chats.pop(chat_id, None)
-        bot_reply = "Извините, возникла временная ошибка при обработке запроса. Попробуйте написать ещё раз."
+        # НЕ ВЫЗЫВАЕМ user_chats.pop — сохраняем контекст пользователя
+        bot_reply = "Извините, возникла временная заминка при обращении к сервису. Попробуйте повторить сообщение еще раз."
 
-    await update.message.reply_text(bot_reply)
+    try:
+        await update.message.reply_text(bot_reply, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Ошибка отправки с Markdown, отправляем обычным текстом: {e}")
+        await update.message.reply_text(bot_reply)
 
 def main():
     # Запускаем Flask в фоновом потоке для Render
