@@ -290,7 +290,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 ID чата: {chat_id}"
         )
      
-        # Пересылаем администратору
+       # Пересылаем администратору
         if ADMIN_CHAT_ID:
             try:
                 # 1. Попытка отправить с разметкой
@@ -308,7 +308,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=ADMIN_CHAT_ID,
                         text=admin_notification_plain
                     )
-                logger.info("Заявка успешно отправлена админу чистым текстом.")
+                    logger.info("Заявка успешно отправлена админу чистым текстом.")  # <-- Теперь правильно (внутри try)
                 except Exception as ex:
                     logger.error(f"Критическая ошибка отправки админу: {ex}")
         else:
