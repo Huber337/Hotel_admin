@@ -1,8 +1,7 @@
 import os
 import logging
-import threading
 from datetime import datetime
-from flask import Flask
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
@@ -12,19 +11,18 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask-сервер для проходимости Health Check на Render
+# Инициализация Flask
 web_app = Flask(__name__)
 
-@web_app.route('/')
-def health_check():
-    return "OK", 200
+# Токены и Переменные Окружения
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Render автоматически задает эту переменную
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+# Инициализация Telegram Application
+telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 # Инициализация Gemini
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Системный промпт для отеля
@@ -168,8 +166,8 @@ def get_user_chat(chat_id: int):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
-    user_chats.pop(user_id, None)  # Ручной сброс контекста только при команде /start
-    
+    user_chats.pop(user_id, None)
+
     welcome_text = (
         "Здравствуйте! 👋 Добро пожаловать в зону отдыха **«Эдем»**!\n\n"
         "Я ваш виртуальный администратор. Могу подсказать по ценам на бассейн, "
@@ -189,16 +187,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         chat = get_user_chat(chat_id)
-        
-        # Передаем контекст текущей даты при каждом запросе
         today_str = datetime.now().strftime("%d.%m.%Y")
         prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
-        
+
         response = chat.send_message(prompt_with_context)
         bot_reply = response.text if response.text else "Извините, не удалось сформировать ответ."
     except Exception as e:
         logger.error(f"Ошибка Gemini: {e}")
-        # НЕ ВЫЗЫВАЕМ user_chats.pop — сохраняем контекст пользователя
         bot_reply = "Извините, возникла временная заминка при обращении к сервису. Попробуйте повторить сообщение еще раз."
 
     try:
@@ -207,19 +202,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Ошибка отправки с Markdown, отправляем обычным текстом: {e}")
         await update.message.reply_text(bot_reply)
 
-def main():
-    # Запускаем Flask в фоновом потоке для Render
-    threading.Thread(target=run_flask, daemon=True).start()
+# Регистрируем хэндлеры Telegram
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-    
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("Бот запущен...")
-    app.run_polling()
+# ---------------- WEBHOOK МАРШРУТЫ FLASK ----------------
+
+@web_app.route('/')
+def health_check():
+    return "OK", 200
+
+@web_app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
+async def webhook():
+    """Принимает входящие запросы от Telegram и передает их в обработчик."""
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        await telegram_app.process_update(update)
+        return "ok", 200
+    return "bad request", 400
+
+# ---------------- ИНИЦИАЛИЗАЦИЯ И ЗАПУСК ----------------
 
 if __name__ == '__main__':
-    main()
+    port = int(os.environ.get("PORT", 10000))
+    
+    # Настраиваем вебхук в Telegram при запуске
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
+        logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
+        
+        async def init_webhook():
+            async with telegram_app:
+                await telegram_app.bot.set_webhook(url=webhook_url)
+                
+        import asyncio
+        asyncio.run(init_webhook())
+        
+        web_app.run(host="0.0.0.0", port=port)
+    else:
+        # Для локального тестирования на ПК
+        logger.info("Запуск бота локально (Polling)...")
+        telegram_app.run_polling()
+
