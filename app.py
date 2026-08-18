@@ -226,21 +226,19 @@ async def webhook():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     
-    # Настраиваем вебхук в Telegram при запуске
-    if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
-        logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
-        
-        async def init_webhook():
-            async with telegram_app:
-                await telegram_app.bot.set_webhook(url=webhook_url)
-                
-        import asyncio
-        asyncio.run(init_webhook())
-        
-        web_app.run(host="0.0.0.0", port=port)
-    else:
-        # Для локального тестирования на ПК
-        logger.info("Запуск бота локально (Polling)...")
-        telegram_app.run_polling()
+    # Жестко задаем URL вашего сервиса Render
+    app_url = "https://hotel-whatsapp-bot-tfhs.onrender.com"
+    webhook_url = f"{app_url}/{TELEGRAM_TOKEN}"
+    
+    logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
+    
+    async def init_webhook():
+        async with telegram_app:
+            await telegram_app.bot.set_webhook(url=webhook_url)
+            
+    import asyncio
+    asyncio.run(init_webhook())
+    
+    web_app.run(host="0.0.0.0", port=port)
+
 
