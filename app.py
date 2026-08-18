@@ -271,28 +271,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Формируем карточку бронирования для администратора
         username_str = f"@{user_info.username}" if user_info.username else "без username"
-        admin_notification = (
-            f"🔔 **НОВАЯ ЗАЯВКА НА БРОНИРОВАНИЕ!**\n"
+        admin_notification_md = (
+            f"🔔 *НОВАЯ ЗАЯВКА НА БРОНИРОВАНИЕ!*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{booking_data}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"👤 **Профиль клиента в TG:** {user_info.full_name} ({username_str})\n"
-            f"🆔 **ID чата:** `{chat_id}`"
+            f"👤 *Профиль клиента в TG:* {user_info.full_name} ({username_str})\n"
+            f"🆔 *ID чата:* `{chat_id}`"
         )
 
-        # Пересылаем администратору, если переменная задана на Render
+     # Текст без Markdown (на случай ошибок форматирования)
+        admin_notification_plain = (
+            f"🔔 НОВАЯ ЗАЯВКА НА БРОНИРОВАНИЕ!\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{booking_data}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Профиль клиента в TG: {user_info.full_name} ({username_str})\n"
+            f"🆔 ID чата: {chat_id}"
+        )
+     
+        # Пересылаем администратору
         if ADMIN_CHAT_ID:
             try:
+                # 1. Попытка отправить с разметкой
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
-                    text=admin_notification,
+                    text=admin_notification_md,
                     parse_mode="Markdown"
                 )
                 logger.info(f"Заявка успешно отправлена админу (ID: {ADMIN_CHAT_ID})")
             except Exception as e:
-                logger.error(f"Ошибка при отправке заявки админу: {e}")
+                logger.warning(f"Ошибка Markdown при отправке админу ({e}). Отправляем чистым текстом...")
+                try:
+                    # 2. Резервная отправка обычным текстом без parse_mode
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=admin_notification_plain
+                    )
+                logger.info("Заявка успешно отправлена админу чистым текстом.")
+                except Exception as ex:
+                    logger.error(f"Критическая ошибка отправки админу: {ex}")
         else:
-            logger.warning("ADMIN_CHAT_ID не установлен в Environment Variables на Render!")
+            logger.warning("ADMIN_CHAT_ID не задан в Environment Variables на Render!")
 
     # --- ОТПРАВКА СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЮ ---
     try:
