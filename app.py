@@ -216,7 +216,13 @@ def health_check():
 async def webhook():
     """Принимает входящие запросы от Telegram и передает их в обработчик."""
     if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        # Инициализируем приложение Telegram, если оно еще не инициализировано
+        if not telegram_app._initialized:
+            await telegram_app.initialize()
+            
+        update_data = request.get_json(force=True)
+        update = Update.de_json(update_data, telegram_app.bot)
+        
         await telegram_app.process_update(update)
         return "ok", 200
     return "bad request", 400
@@ -226,6 +232,20 @@ async def webhook():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     
+    app_url = "https://hotel-whatsapp-bot-tfhs.onrender.com"
+    webhook_url = f"{app_url}/{TELEGRAM_TOKEN}"
+    
+    logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
+    
+    async def init_webhook():
+        async with telegram_app:
+            await telegram_app.bot.set_webhook(url=webhook_url)
+            
+    import asyncio
+    asyncio.run(init_webhook())
+    
+    web_app.run(host="0.0.0.0", port=port)
+  
     # Жестко задаем URL вашего сервиса Render
     app_url = "https://hotel-whatsapp-bot-tfhs.onrender.com"
     webhook_url = f"{app_url}/{TELEGRAM_TOKEN}"
