@@ -297,7 +297,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
        # Пересылаем администратору
         if ADMIN_CHAT_ID:
             try:
-                # 1. Попытка отправить с разметкой
+                # Пробуем отправку с Markdown
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
                     text=admin_notification_md,
@@ -305,18 +305,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 logger.info(f"Заявка успешно отправлена админу (ID: {ADMIN_CHAT_ID})")
             except Exception as e:
-                logger.warning(f"Ошибка Markdown при отправке админу ({e}). Отправляем чистым текстом...")
+                logger.warning(f"Ошибка отправки с Markdown: {e}. Отправляем чистым текстом...")
                 try:
-                    # 2. Резервная отправка обычным текстом без parse_mode
+                    # Резервная отправка без parse_mode
                     await context.bot.send_message(
                         chat_id=ADMIN_CHAT_ID,
                         text=admin_notification_plain
                     )
-                    logger.info("Заявка успешно отправлена админу чистым текстом.")  # <-- Теперь правильно (внутри try)
+                    logger.info("Заявка успешно отправлена админу чистым текстом.")
                 except Exception as ex:
-                    logger.error(f"Критическая ошибка отправки админу: {ex}")
+                    logger.error(f"Критическая ошибка отправки админу (проверьте ADMIN_CHAT_ID): {ex}")
         else:
-            logger.warning("ADMIN_CHAT_ID не задан в Environment Variables на Render!")
+            logger.warning("ADMIN_CHAT_ID не установлен в Environment Variables на Render!")
 
     # --- ОТПРАВКА СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЮ ---
     try:
@@ -328,6 +328,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Регистрируем хэндлеры Telegram
 telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("id", lambda u, c: u.message.reply_text(f"ID: {u.effective_chat.id}")))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 # ---------------- ИНИЦИАЛИЗАЦИЯ И EVENT LOOP ----------------
