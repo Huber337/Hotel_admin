@@ -247,7 +247,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
+    # Игнорируем сообщения, отправленные ВНУТРИ группы/супергруппы,
+    # чтобы бот общался с клиентами ТОЛЬКО в ЛИЧНЫХ сообщениях!
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+     
     chat_id = update.effective_chat.id
     user_text = update.message.text.strip()
     user_info = update.effective_user
