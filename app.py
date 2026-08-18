@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from datetime import datetime
 from flask import Flask, request
 from telegram import Update
@@ -17,7 +18,6 @@ web_app = Flask(__name__)
 # Токены и Переменные Окружения
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Render автоматически задает эту переменную
 
 # Инициализация Telegram Application
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -156,7 +156,7 @@ user_chats = {}
 def get_user_chat(chat_id: int):
     if chat_id not in user_chats:
         user_chats[chat_id] = client.chats.create(
-            model="gemini-3.6-flash",
+            model="gemini-2.5-flash",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0.7,
@@ -190,10 +190,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_str = datetime.now().strftime("%d.%m.%Y")
         prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
 
-        response = chat.send_message(prompt_with_context)
-        bot_reply = response.text if response.text else "Извините, не удалось сформировать ответ."
+        # Запускаем синхронный вызов Gemini в отдельном потоке, чтобы не блокировать asyncio loop
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, lambda: chat.send_message(prompt_with_context))
+        
+        bot_reply = response.text if response and response.text else "Извините, не удалось сформировать ответ."
     except Exception as e:
-        logger.error(f"Ошибка Gemini: {e}")
+        logger.error(f"Ошибка Gemini: {e}", exc_info=True)
         bot_reply = "Извините, возникла временная заминка при обращении к сервису. Попробуйте повторить сообщение еще раз."
 
     try:
@@ -216,13 +219,12 @@ def health_check():
 async def webhook():
     """Принимает входящие запросы от Telegram и передает их в обработчик."""
     if request.method == "POST":
-        # Инициализируем приложение Telegram, если оно еще не инициализировано
         if not telegram_app._initialized:
             await telegram_app.initialize()
-            
+
         update_data = request.get_json(force=True)
         update = Update.de_json(update_data, telegram_app.bot)
-        
+
         await telegram_app.process_update(update)
         return "ok", 200
     return "bad request", 400
@@ -231,34 +233,16 @@ async def webhook():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    
     app_url = "https://hotel-whatsapp-bot-tfhs.onrender.com"
     webhook_url = f"{app_url}/{TELEGRAM_TOKEN}"
-    
+
     logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
-    
+
     async def init_webhook():
         async with telegram_app:
             await telegram_app.bot.set_webhook(url=webhook_url)
-            
-    import asyncio
-    asyncio.run(init_webhook())
-    
-    web_app.run(host="0.0.0.0", port=port)
-  
-    # Жестко задаем URL вашего сервиса Render
-    app_url = "https://hotel-whatsapp-bot-tfhs.onrender.com"
-    webhook_url = f"{app_url}/{TELEGRAM_TOKEN}"
-    
-    logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
-    
-    async def init_webhook():
-        async with telegram_app:
-            await telegram_app.bot.set_webhook(url=webhook_url)
-            
-    import asyncio
-    asyncio.run(init_webhook())
-    
-    web_app.run(host="0.0.0.0", port=port)
 
+    asyncio.run(init_webhook())
 
+    # Запускаем Flask
+    web_app.run(host="0.0.0.0", port=port)
