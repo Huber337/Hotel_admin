@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import threading
 from datetime import datetime
 from flask import Flask, request
 from telegram import Update
@@ -18,14 +19,15 @@ web_app = Flask(__name__)
 # Токены и Переменные Окружения
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://hotel-whatsapp-bot-tfhs.onrender.com")
 
 # Инициализация Telegram Application
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# Инициализация Gemini
+# Инициализация Gemini Client
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Системный промпт для отеля
+# Системный промпт
 SYSTEM_INSTRUCTION = """
 Ты — профессиональный, гостеприимный и вежливый ИИ-администратор зоны отдыха "Эдем".
 
@@ -190,10 +192,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_str = datetime.now().strftime("%d.%m.%Y")
         prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
 
-        # Запускаем синхронный вызов Gemini в отдельном потоке, чтобы не блокировать asyncio loop
+        # Используем асинхронный вызов через run_in_executor
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(None, lambda: chat.send_message(prompt_with_context))
-        
+
         bot_reply = response.text if response and response.text else "Извините, не удалось сформировать ответ."
     except Exception as e:
         logger.error(f"Ошибка Gemini: {e}", exc_info=True)
@@ -209,6 +211,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+# ---------------- ИНИЦИАЛИЗАЦИЯ И EVENT LOOP ----------------
+
+main_loop = asyncio.new_event_loop()
+
+def start_background_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    
+    async def init():
+        await telegram_app.initialize()
+        await telegram_app.start()
+        webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}"
+        logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
+        await telegram_app.bot.set_webhook(url=webhook_url)
+
+    loop.run_until_complete(init())
+    loop.run_forever()
+
+# Запускаем фоновый цикл СРАЗУ при импорте модуля
+t = threading.Thread(target=start_background_loop, args=(main_loop,), daemon=True)
+t.start()
+
 # ---------------- WEBHOOK МАРШРУТЫ FLASK ----------------
 
 @web_app.route('/')
@@ -216,33 +239,19 @@ def health_check():
     return "OK", 200
 
 @web_app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
-async def webhook():
-    """Принимает входящие запросы от Telegram и передает их в обработчик."""
+def webhook():
+    """Синхронный маршрут Flask. Принимает запрос и безопасно передает его в фоновый цикл PTB."""
     if request.method == "POST":
-        if not telegram_app._initialized:
-            await telegram_app.initialize()
-
         update_data = request.get_json(force=True)
         update = Update.de_json(update_data, telegram_app.bot)
-
-        await telegram_app.process_update(update)
+        
+        asyncio.run_coroutine_threadsafe(
+            telegram_app.process_update(update), 
+            main_loop
+        )
         return "ok", 200
     return "bad request", 400
 
-# ---------------- ИНИЦИАЛИЗАЦИЯ И ЗАПУСК ----------------
-
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    app_url = "https://hotel-whatsapp-bot-tfhs.onrender.com"
-    webhook_url = f"{app_url}/{TELEGRAM_TOKEN}"
-
-    logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
-
-    async def init_webhook():
-        async with telegram_app:
-            await telegram_app.bot.set_webhook(url=webhook_url)
-
-    asyncio.run(init_webhook())
-
-    # Запускаем Flask
     web_app.run(host="0.0.0.0", port=port)
