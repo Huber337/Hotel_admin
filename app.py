@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
+from groq import Groq
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -19,13 +20,15 @@ web_app = Flask(__name__)
 # Токены и Переменные Окружения
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://hotel-whatsapp-bot-tfhs.onrender.com")
 
 # Инициализация Telegram Application
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# Инициализация Gemini Client
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Инициализация клиентов ИИ
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Системный промпт
 SYSTEM_INSTRUCTION = """
@@ -152,12 +155,14 @@ SYSTEM_INSTRUCTION = """
 [/BOOKING_READY]
 """
 
-# Хранение чат-сессий пользователей
-user_chats = {}
+# Хранение сессий
+user_chats = {}       # Для Gemini
+user_histories = {}   # Параллельная история для Groq (формат OpenAI)
 
 def get_user_chat(chat_id: int):
+    """Инициализация Gemini-чата"""
     if chat_id not in user_chats:
-        user_chats[chat_id] = client.chats.create(
+        user_chats[chat_id] = gemini_client.chats.create(
             model="gemini-3.5-flash-lite",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
@@ -166,9 +171,63 @@ def get_user_chat(chat_id: int):
         )
     return user_chats[chat_id]
 
+def ask_groq(chat_id: int, user_text: str, today_str: str) -> str:
+    """Резервная обработка через Groq (Llama 3.1 8B Instant)"""
+    if not groq_client:
+        logger.error("GROQ_API_KEY не установлен в переменных окружения.")
+        return "Извините, сервис временно недоступен. Попробуйте написать чуть позже."
+
+    if chat_id not in user_histories:
+        user_histories[chat_id] = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION}
+        ]
+
+    prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
+    user_histories[chat_id].append({"role": "user", "content": prompt_with_context})
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=user_histories[chat_id],
+            temperature=0.7,
+            max_tokens=1024
+        )
+        bot_reply = completion.choices[0].message.content
+        user_histories[chat_id].append({"role": "assistant", "content": bot_reply})
+        return bot_reply
+    except Exception as e:
+        logger.error(f"Ошибка Groq API: {e}", exc_info=True)
+        return "Извините, возникла заминка при обработке запроса. Попробуйте еще раз через минуту."
+
+def generate_ai_response(chat_id: int, user_text: str) -> str:
+    """Синхронная функция отправки запроса с логикой аварийного переключения (Fallback)"""
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
+
+    # 1. Первая попытка: Gemini
+    try:
+        chat = get_user_chat(chat_id)
+        response = chat.send_message(prompt_with_context)
+        
+        if response and response.text:
+            # Если Gemini ответил успешно, сохраняем диалог в истории для Groq (для бесшовного перехода)
+            if chat_id not in user_histories:
+                user_histories[chat_id] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+            user_histories[chat_id].append({"role": "user", "content": prompt_with_context})
+            user_histories[chat_id].append({"role": "assistant", "content": response.text})
+            return response.text
+            
+    except Exception as e:
+        error_str = str(e).lower()
+        logger.warning(f"Ошибка Gemini ({e}). Переключаемся на Groq fallback...")
+
+    # 2. Переключение на Groq, если Gemini выдал ошибку (429/Quota/другие)
+    return ask_groq(chat_id, user_text, today_str)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     user_chats.pop(user_id, None)
+    user_histories.pop(user_id, None)
 
     welcome_text = (
         "Здравствуйте! 👋 Добро пожаловать в зону отдыха **«Эдем»**!\n\n"
@@ -187,19 +246,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    try:
-        chat = get_user_chat(chat_id)
-        today_str = datetime.now().strftime("%d.%m.%Y")
-        prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
-
-        # Используем асинхронный вызов через run_in_executor
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: chat.send_message(prompt_with_context))
-
-        bot_reply = response.text if response and response.text else "Извините, не удалось сформировать ответ."
-    except Exception as e:
-        logger.error(f"Ошибка Gemini: {e}", exc_info=True)
-        bot_reply = "Извините, возникла временная заминка при обращении к сервису. Попробуйте повторить сообщение еще раз."
+    loop = asyncio.get_running_loop()
+    bot_reply = await loop.run_in_executor(None, lambda: generate_ai_response(chat_id, user_text))
 
     try:
         await update.message.reply_text(bot_reply, parse_mode="Markdown")
