@@ -1,11 +1,9 @@
 import os
 import re
 import logging
-import asyncio
+import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
-from telegram import Update
-from telegram.ext import Application
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -37,14 +35,10 @@ if GREEN_ID_INSTANCE and GREEN_API_TOKEN:
 ADMIN_CHAT_ID_ENV = os.environ.get("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_ENV) if ADMIN_CHAT_ID_ENV else None
 
-# Инициализация Telegram Application
-telegram_app = Application.builder().token(TELEGRAM_TOKEN).build() if TELEGRAM_TOKEN else None
-
 # Инициализация клиентов ИИ
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# ОПТИМИЗИРОВАННЫЙ СИСТЕМНЫЙ ПРОМПТ
 SYSTEM_INSTRUCTION = """
 Ты — профессиональный, гостеприимный и вежливый ИИ-администратор зоны отдыха "Эдем".
 
@@ -181,14 +175,52 @@ SYSTEM_INSTRUCTION = """
 user_chats = {}
 user_histories = {}
 
+def clean_reasoning(text: str) -> str:
+    """Удаляет мыслительные блоки <think>...</think> из ответа модели."""
+    if not text:
+        return ""
+    clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    return clean_text.strip()
+
+def send_telegram_message(chat_id: int, text: str):
+    """Синхронная отправка сообщений в Telegram (без asyncio)."""
+    if not TELEGRAM_TOKEN or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        if not resp.ok:
+            payload.pop("parse_mode")
+            requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"Ошибка отправки в Telegram: {e}")
+
+def send_admin_notification(booking_data: str, source_info: str):
+    """Надежная отправка заявки админу."""
+    if not ADMIN_CHAT_ID:
+        return
+    admin_notification_md = (
+        f"🔔 *НОВАЯ ЗАЯВКА НА БРОНИРОВАНИЕ!*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{booking_data}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{source_info}"
+    )
+    send_telegram_message(ADMIN_CHAT_ID, admin_notification_md)
+
 def get_user_chat(chat_id):
     if chat_id not in user_chats:
         user_chats[chat_id] = gemini_client.chats.create(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",  # ИСПРАВЛЕНО: Рабочая модель
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0.3,
-                max_output_tokens=300,
+                max_output_tokens=400,
             )
         )
     return user_chats[chat_id]
@@ -209,9 +241,9 @@ def ask_groq(chat_id, user_text: str, today_str: str) -> str:
             messages=user_histories[chat_id],
             temperature=0.3,
             max_tokens=400,
-            extra_body={"reasoning_format": "hidden"},  # Запятая поставлена
+            extra_body={"reasoning_format": "hidden"},
         )
-        bot_reply = completion.choices[0].message.content
+        bot_reply = clean_reasoning(completion.choices[0].message.content)
         user_histories[chat_id].append({"role": "assistant", "content": bot_reply})
         return bot_reply
     except Exception as e:
@@ -227,34 +259,16 @@ def generate_ai_response(chat_id, user_text: str) -> str:
             chat = get_user_chat(chat_id)
             response = chat.send_message(prompt_with_context)
             if response and response.text:
+                clean_text = clean_reasoning(response.text)
                 if chat_id not in user_histories:
                     user_histories[chat_id] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
                 user_histories[chat_id].append({"role": "user", "content": prompt_with_context})
-                user_histories[chat_id].append({"role": "assistant", "content": response.text})
-                return response.text
+                user_histories[chat_id].append({"role": "assistant", "content": clean_text})
+                return clean_text
     except Exception as e:
         logger.warning(f"Ошибка Gemini ({e}). Переключаемся на Groq fallback...")
 
     return ask_groq(chat_id, user_text, today_str)
-
-async def send_admin_notification(booking_data: str, source_info: str):
-    if not ADMIN_CHAT_ID or not telegram_app:
-        return
-    admin_notification_md = (
-        f"🔔 *НОВАЯ ЗАЯВКА НА БРОНИРОВАНИЕ!*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{booking_data}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{source_info}"
-    )
-    try:
-        await telegram_app.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=admin_notification_md,
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.warning(f"Ошибка отправки уведомления админу: {e}")
 
 # ---------------- WEBHOOK МАРШРУТЫ FLASK ----------------
 
@@ -264,17 +278,21 @@ def health_check():
 
 @web_app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
 def telegram_webhook():
-    if not telegram_app:
+    if not TELEGRAM_TOKEN:
         return "Bot non active", 500
 
     try:
         update_data = request.get_json(force=True)
-        update = Update.de_json(update_data, telegram_app.bot)
+        
+        if update_data and "message" in update_data:
+            msg = update_data["message"]
+            chat_id = msg.get("chat", {}).get("id")
+            user_text = msg.get("text", "").strip()
+            chat_type = msg.get("chat", {}).get("type")
+            from_user = msg.get("from", {})
 
-        if update and update.message and update.message.text:
-            chat_id = update.effective_chat.id
-            user_text = update.message.text.strip()
-            user_info = update.effective_user
+            if not user_text or chat_type in ["group", "supergroup"]:
+                return "ok", 200
 
             if user_text.startswith("/start"):
                 welcome_text = (
@@ -283,33 +301,27 @@ def telegram_webhook():
                     "номерам в отеле, тапчанам и помочь забронировать отдых.\n\n"
                     "Чем могу вам помочь?"
                 )
-                asyncio.run(telegram_app.bot.send_message(chat_id=chat_id, text=welcome_text, parse_mode="Markdown"))
-                return "ok", 200
-
-            if update.effective_chat.type in ["group", "supergroup"]:
+                send_telegram_message(chat_id, welcome_text)
                 return "ok", 200
 
             raw_reply = generate_ai_response(chat_id, user_text)
 
             pattern = r"\[BOOKING_READY\](.*?)\[/BOOKING_READY\]"
-            match = re.search(pattern, raw_reply, re.DOTALL)
+            match = re.search(pattern, raw_reply, re.DOTALL | re.IGNORECASE)
             user_reply = raw_reply
 
             if match:
                 booking_data = match.group(1).strip()
-                user_reply = re.sub(pattern, "", raw_reply, flags=re.DOTALL).strip()
-                username_str = f"@{user_info.username}" if user_info.username else "без username"
+                user_reply = re.sub(pattern, "", raw_reply, flags=re.DOTALL | re.IGNORECASE).strip()
+                username_str = f"@{from_user.get('username')}" if from_user.get('username') else "без username"
+                full_name = f"{from_user.get('first_name', '')} {from_user.get('last_name', '')}".strip()
                 source_info = (
-                    f"👤 *Профиль клиента в TG:* {user_info.full_name} ({username_str})\n"
+                    f"👤 *Профиль клиента в TG:* {full_name} ({username_str})\n"
                     f"🆔 *ID чата:* `{chat_id}`"
                 )
-                asyncio.run(send_admin_notification(booking_data, source_info))
+                send_admin_notification(booking_data, source_info)
 
-            try:
-                asyncio.run(telegram_app.bot.send_message(chat_id=chat_id, text=user_reply, parse_mode="Markdown"))
-            except Exception:
-                clean_text = user_reply.replace("*", "").replace("_", "")
-                asyncio.run(telegram_app.bot.send_message(chat_id=chat_id, text=clean_text))
+            send_telegram_message(chat_id, user_reply)
 
         return "ok", 200
     except Exception as e:
@@ -339,19 +351,19 @@ def whatsapp_webhook():
             raw_reply = generate_ai_response(session_id, text_message)
 
             pattern = r"\[BOOKING_READY\](.*?)\[/BOOKING_READY\]"
-            match = re.search(pattern, raw_reply, re.DOTALL)
+            match = re.search(pattern, raw_reply, re.DOTALL | re.IGNORECASE)
             user_reply = raw_reply
 
             if match:
                 booking_data = match.group(1).strip()
-                user_reply = re.sub(pattern, "", raw_reply, flags=re.DOTALL).strip()
+                user_reply = re.sub(pattern, "", raw_reply, flags=re.DOTALL | re.IGNORECASE).strip()
                 phone_clean = wa_chat_id.replace("@c.us", "")
                 source_info = (
                     f"🟢 *Источник:* WhatsApp\n"
                     f"👤 *Имя:* {sender_name}\n"
                     f"📱 *Телефон:* +{phone_clean}"
                 )
-                asyncio.run(send_admin_notification(booking_data, source_info))
+                send_admin_notification(booking_data, source_info)
 
             try:
                 clean_reply = user_reply.replace("**", "*")
