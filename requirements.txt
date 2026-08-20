@@ -6,3 +6,4 @@ groq
 whatsapp-api-client-python
 gunicorn
 gevent
+packaging
