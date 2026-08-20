@@ -2,11 +2,10 @@ import os
 import re
 import logging
 import asyncio
-import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -29,20 +28,20 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://hotel-whats
 GREEN_ID_INSTANCE = os.environ.get("GREEN_ID_INSTANCE")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
 
-# Инициализация клиента GREEN-API (если ключи заданы в Environment Variables)
+# Инициализация клиента GREEN-API
 green_api = None
 if GREEN_ID_INSTANCE and GREEN_API_TOKEN:
     green_api = API.GreenApi(GREEN_ID_INSTANCE, GREEN_API_TOKEN)
 
-# ID администратора/чата для пересылки броней (задаётся в Environment Variables на Render)
+# ID администратора
 ADMIN_CHAT_ID_ENV = os.environ.get("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_ENV) if ADMIN_CHAT_ID_ENV else None
 
 # Инициализация Telegram Application
-telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+telegram_app = Application.builder().token(TELEGRAM_TOKEN).build() if TELEGRAM_TOKEN else None
 
 # Инициализация клиентов ИИ
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Системный промпт
@@ -173,15 +172,13 @@ SYSTEM_INSTRUCTION = """
 [/BOOKING_READY]
 """
 
-# Хранение сессий
-user_chats = {}       # Для Gemini
-user_histories = {}   # Параллельная история для Groq (формат OpenAI)
+user_chats = {}
+user_histories = {}
 
 def get_user_chat(chat_id):
-    """Инициализация Gemini-чата"""
     if chat_id not in user_chats:
         user_chats[chat_id] = gemini_client.chats.create(
-            model="gemini-3.5-flash-lite",
+            model="gemini-2.5-flash",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0.7,
@@ -190,15 +187,11 @@ def get_user_chat(chat_id):
     return user_chats[chat_id]
 
 def ask_groq(chat_id, user_text: str, today_str: str) -> str:
-    """Резервная обработка через Groq (Llama 3.3 70B Versatile)"""
     if not groq_client:
-        logger.error("GROQ_API_KEY не установлен в переменных окружения.")
         return "Извините, сервис временно недоступен. Попробуйте написать чуть позже."
 
     if chat_id not in user_histories:
-        user_histories[chat_id] = [
-            {"role": "system", "content": SYSTEM_INSTRUCTION}
-        ]
+        user_histories[chat_id] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
 
     prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
     user_histories[chat_id].append({"role": "user", "content": prompt_with_context})
@@ -218,48 +211,27 @@ def ask_groq(chat_id, user_text: str, today_str: str) -> str:
         return "Извините, возникла заминка при обработке запроса. Попробуйте еще раз через минуту."
 
 def generate_ai_response(chat_id, user_text: str) -> str:
-    """Синхронная функция отправки запроса с логикой аварийного переключения (Fallback)"""
     today_str = datetime.now().strftime("%d.%m.%Y")
     prompt_with_context = f"[Системный контекст: Сегодняшняя дата — {today_str}]\n{user_text}"
 
-    # 1. Первая попытка: Gemini
     try:
-        chat = get_user_chat(chat_id)
-        response = chat.send_message(prompt_with_context)
-        
-        if response and response.text:
-            # Если Gemini ответил успешно, сохраняем диалог в истории для Groq (для бесшовного перехода)
-            if chat_id not in user_histories:
-                user_histories[chat_id] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
-            user_histories[chat_id].append({"role": "user", "content": prompt_with_context})
-            user_histories[chat_id].append({"role": "assistant", "content": response.text})
-            return response.text
-            
+        if gemini_client:
+            chat = get_user_chat(chat_id)
+            response = chat.send_message(prompt_with_context)
+            if response and response.text:
+                if chat_id not in user_histories:
+                    user_histories[chat_id] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+                user_histories[chat_id].append({"role": "user", "content": prompt_with_context})
+                user_histories[chat_id].append({"role": "assistant", "content": response.text})
+                return response.text
     except Exception as e:
         logger.warning(f"Ошибка Gemini ({e}). Переключаемся на Groq fallback...")
 
-    # 2. Переключение на Groq, если Gemini выдал ошибку (429/Quota/другие)
     return ask_groq(chat_id, user_text, today_str)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    user_chats.pop(user_id, None)
-    user_histories.pop(user_id, None)
-
-    welcome_text = (
-        "Здравствуйте! 👋 Добро пожаловать в зону отдыха **«Эдем»**!\n\n"
-        "Я ваш виртуальный администратор. Могу подсказать по ценам на бассейн, "
-        "номерам в отеле, тапчанам и помочь забронировать отдых.\n\n"
-        "Чем могу вам помочь?"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
-
 async def send_admin_notification(booking_data: str, source_info: str):
-    """Вспомогательная асинхронная функция отправки брони администратору в Telegram"""
-    if not ADMIN_CHAT_ID:
-        logger.warning("ADMIN_CHAT_ID не установлен в Environment Variables!")
+    if not ADMIN_CHAT_ID or not telegram_app:
         return
-
     admin_notification_md = (
         f"🔔 *НОВАЯ ЗАЯВКА НА БРОНИРОВАНИЕ!*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -267,100 +239,14 @@ async def send_admin_notification(booking_data: str, source_info: str):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{source_info}"
     )
-
-    admin_notification_plain = (
-        f"🔔 НОВАЯ ЗАЯВКА НА БРОНИРОВАНИЕ!\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{booking_data}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{source_info.replace('*', '').replace('`', '')}"
-    )
-
     try:
         await telegram_app.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=admin_notification_md,
             parse_mode="Markdown"
         )
-        logger.info(f"Заявка успешно отправлена админу (ID: {ADMIN_CHAT_ID})")
     except Exception as e:
-        logger.warning(f"Ошибка отправки с Markdown: {e}. Отправляем чистым текстом...")
-        try:
-            await telegram_app.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=admin_notification_plain
-            )
-            logger.info("Заявка успешно отправлена админу чистым текстом.")
-        except Exception as ex:
-            logger.error(f"Критическая ошибка отправки админу: {ex}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    # Игнорируем сообщения, отправленные ВНУТРИ группы/супергруппы,
-    # чтобы бот общался с клиентами ТОЛЬКО в ЛИЧНЫХ сообщениях!
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-      
-    chat_id = update.effective_chat.id
-    user_text = update.message.text.strip()
-    user_info = update.effective_user
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    loop = asyncio.get_running_loop()
-    raw_reply = await loop.run_in_executor(None, lambda: generate_ai_response(chat_id, user_text))
-
-    # --- ПАРСИНГ И СКРЫТИЕ СИСТЕМНОГО БЛОКА [BOOKING_READY] ---
-    pattern = r"\[BOOKING_READY\](.*?)\[/BOOKING_READY\]"
-    match = re.search(pattern, raw_reply, re.DOTALL)
-
-    user_reply = raw_reply
-
-    if match:
-        booking_data = match.group(1).strip()
-        user_reply = re.sub(pattern, "", raw_reply, flags=re.DOTALL).strip()
-
-        username_str = f"@{user_info.username}" if user_info.username else "без username"
-        source_info = (
-            f"👤 *Профиль клиента в TG:* {user_info.full_name} ({username_str})\n"
-            f"🆔 *ID чата:* `{chat_id}`"
-        )
-        await send_admin_notification(booking_data, source_info)
-
-    # --- ОТПРАВКА СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЮ ---
-    try:
-        await update.message.reply_text(user_reply, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning(f"Ошибка отправки с Markdown ({e}), отправка очищенным текстом")
-        clean_text = user_reply.replace("*", "").replace("_", "")
-        await update.message.reply_text(clean_text)
-
-# Регистрируем хэндлеры Telegram
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("id", lambda u, c: u.message.reply_text(f"ID: {u.effective_chat.id}")))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-# ---------------- ИНИЦИАЛИЗАЦИЯ И EVENT LOOP ----------------
-
-main_loop = asyncio.new_event_loop()
-
-def start_background_loop(loop: asyncio.AbstractEventLoop):
-    asyncio.set_event_loop(loop)
-    
-    async def init():
-        await telegram_app.initialize()
-        await telegram_app.start()
-        webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}"
-        logger.info(f"Регистрация Webhook в Telegram: {webhook_url}")
-        await telegram_app.bot.set_webhook(url=webhook_url)
-
-    loop.run_until_complete(init())
-    loop.run_forever()
-
-# Запускаем фоновый цикл СРАЗУ при импорте модуля
-t = threading.Thread(target=start_background_loop, args=(main_loop,), daemon=True)
-t.start()
+        logger.warning(f"Ошибка отправки уведомления админу: {e}")
 
 # ---------------- WEBHOOK МАРШРУТЫ FLASK ----------------
 
@@ -369,22 +255,66 @@ def health_check():
     return "OK", 200
 
 @web_app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
-def webhook():
-    """Синхронный маршрут Flask для Telegram Webhook"""
-    if request.method == "POST":
+def telegram_webhook():
+    """Асинхронный обработчик сообщений Telegram без сторонних тредов"""
+    if not telegram_app:
+        return "Bot non active", 500
+
+    try:
         update_data = request.get_json(force=True)
         update = Update.de_json(update_data, telegram_app.bot)
-        
-        asyncio.run_coroutine_threadsafe(
-            telegram_app.process_update(update), 
-            main_loop
-        )
+
+        if update and update.message and update.message.text:
+            chat_id = update.effective_chat.id
+            user_text = update.message.text.strip()
+            user_info = update.effective_user
+
+            # Реакция на команду /start
+            if user_text.startswith("/start"):
+                welcome_text = (
+                    "Здравствуйте! 👋 Добро пожаловать в зону отдыха *«Эдем»*!\n\n"
+                    "Я ваш виртуальный администратор. Могу подсказать по ценам на бассейн, "
+                    "номерам в отеле, тапчанам и помочь забронировать отдых.\n\n"
+                    "Чем могу вам помочь?"
+                )
+                asyncio.run(telegram_app.bot.send_message(chat_id=chat_id, text=welcome_text, parse_mode="Markdown"))
+                return "ok", 200
+
+            # Игнорируем сообщения из групп
+            if update.effective_chat.type in ["group", "supergroup"]:
+                return "ok", 200
+
+            # Генерация ответа через ИИ
+            raw_reply = generate_ai_response(chat_id, user_text)
+
+            pattern = r"\[BOOKING_READY\](.*?)\[/BOOKING_READY\]"
+            match = re.search(pattern, raw_reply, re.DOTALL)
+            user_reply = raw_reply
+
+            if match:
+                booking_data = match.group(1).strip()
+                user_reply = re.sub(pattern, "", raw_reply, flags=re.DOTALL).strip()
+                username_str = f"@{user_info.username}" if user_info.username else "без username"
+                source_info = (
+                    f"👤 *Профиль клиента в TG:* {user_info.full_name} ({username_str})\n"
+                    f"🆔 *ID чата:* `{chat_id}`"
+                )
+                asyncio.run(send_admin_notification(booking_data, source_info))
+
+            # Отправка ответа пользователю
+            try:
+                asyncio.run(telegram_app.bot.send_message(chat_id=chat_id, text=user_reply, parse_mode="Markdown"))
+            except Exception:
+                clean_text = user_reply.replace("*", "").replace("_", "")
+                asyncio.run(telegram_app.bot.send_message(chat_id=chat_id, text=clean_text))
+
         return "ok", 200
-    return "bad request", 400
+    except Exception as e:
+        logger.error(f"Ошибка в Telegram Webhook: {e}", exc_info=True)
+        return "ok", 200
 
 @web_app.route('/whatsapp-webhook', methods=['POST'])
 def whatsapp_webhook():
-    """Синхронный маршрут Flask для WhatsApp GREEN-API Webhook"""
     data = request.get_json(silent=True) or {}
     type_webhook = data.get("typeWebhook")
 
@@ -392,49 +322,35 @@ def whatsapp_webhook():
         message_data = data.get("messageData", {})
         sender_data = data.get("senderData", {})
         
-        wa_chat_id = sender_data.get("chatId")  # Формат: '7701XXXXXXX@c.us'
+        wa_chat_id = sender_data.get("chatId")
         sender_name = sender_data.get("senderName", "Клиент WhatsApp")
         text_message = ""
 
-        # Извлекаем текст сообщения
         if message_data.get("typeMessage") == "textMessage":
             text_message = message_data.get("textMessageData", {}).get("textMessage", "")
         elif message_data.get("typeMessage") == "extendedTextMessage":
             text_message = message_data.get("extendedTextMessageData", {}).get("text", "")
 
         if text_message and wa_chat_id and green_api:
-            # Идентификатор сессии для ИИ
             session_id = f"wa_{wa_chat_id}"
-
-            # Генерация ответа ИИ
             raw_reply = generate_ai_response(session_id, text_message)
 
-            # Проверка наличия блока [BOOKING_READY]
             pattern = r"\[BOOKING_READY\](.*?)\[/BOOKING_READY\]"
             match = re.search(pattern, raw_reply, re.DOTALL)
-            
             user_reply = raw_reply
 
             if match:
                 booking_data = match.group(1).strip()
                 user_reply = re.sub(pattern, "", raw_reply, flags=re.DOTALL).strip()
-
                 phone_clean = wa_chat_id.replace("@c.us", "")
                 source_info = (
                     f"🟢 *Источник:* WhatsApp\n"
                     f"👤 *Имя:* {sender_name}\n"
                     f"📱 *Телефон:* +{phone_clean}"
                 )
-                
-                # Безопасно передаем задачу отправки администратору в фоновый event loop
-                asyncio.run_coroutine_threadsafe(
-                    send_admin_notification(booking_data, source_info),
-                    main_loop
-                )
+                asyncio.run(send_admin_notification(booking_data, source_info))
 
-            # Отправка ответа пользователю в WhatsApp через GREEN-API
             try:
-                # Очищаем маркдаун для чистого форматирования
                 clean_reply = user_reply.replace("**", "*")
                 green_api.sending.sendMessage(wa_chat_id, clean_reply)
             except Exception as e:
