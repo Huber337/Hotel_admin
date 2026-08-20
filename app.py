@@ -187,8 +187,8 @@ def ask_groq(chat_id, user_text: str, today_str: str) -> str:
             model="openai/gpt-oss-120b",
             messages=user_histories[chat_id],
             temperature=0.3,
-            max_tokens=300
-            extra_body={"reasoning_format": "hidden"}  # Прячет блоки рассуждений
+            max_tokens=400,
+            extra_body={"reasoning_format": "hidden"},  # Запятая поставлена
         )
         bot_reply = completion.choices[0].message.content
         user_histories[chat_id].append({"role": "assistant", "content": bot_reply})
