@@ -184,10 +184,11 @@ def ask_groq(chat_id, user_text: str, today_str: str) -> str:
 
     try:
         completion = groq_client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
+            model="openai/gpt-oss-120b",
             messages=user_histories[chat_id],
             temperature=0.3,
             max_tokens=300
+            extra_body={"reasoning_format": "hidden"}  # Прячет блоки рассуждений
         )
         bot_reply = completion.choices[0].message.content
         user_histories[chat_id].append({"role": "assistant", "content": bot_reply})
