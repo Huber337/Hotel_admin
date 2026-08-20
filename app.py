@@ -198,7 +198,7 @@ def ask_groq(chat_id, user_text: str, today_str: str) -> str:
 
     try:
         completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=user_histories[chat_id],
             temperature=0.7,
             max_tokens=1024
