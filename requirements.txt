@@ -4,3 +4,5 @@ flask
 asgiref
 groq
 whatsapp-api-client-python
+gunicorn
+gevent
